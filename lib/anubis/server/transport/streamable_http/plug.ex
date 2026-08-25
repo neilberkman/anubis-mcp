@@ -115,39 +115,396 @@ if Code.ensure_loaded?(Plug) do
       end
     end
 
+    # MCP revision 2026-07-28 ("modern") removed sessions and the initialize
+    # handshake: every request carries its protocol version, client identity
+    # and capabilities in `params._meta`, and the server answers each one on
+    # its own. Revisions up to 2025-11-25 ("legacy") establish a session with
+    # `initialize`. This transport serves both on the same endpoint, selecting
+    # by the `MCP-Protocol-Version` header exactly as the specification's
+    # dual-era server does: a modern request is served statelessly, anything
+    # else takes the session path it always took.
+    @modern_version "2026-07-28"
+    @meta_version "io.modelcontextprotocol/protocolVersion"
+    @meta_client_info "io.modelcontextprotocol/clientInfo"
+    @meta_client_capabilities "io.modelcontextprotocol/clientCapabilities"
+    @meta_server_info "io.modelcontextprotocol/serverInfo"
+    @modern_meta_keys [
+      @meta_version,
+      @meta_client_info,
+      @meta_client_capabilities,
+      "io.modelcontextprotocol/logLevel"
+    ]
+    @header_mismatch_code -32_020
+    @unsupported_version_code -32_022
+    @discover_ttl_ms 300_000
+    @list_ttl_ms 60_000
+    @cacheable_methods ~w(tools/list prompts/list resources/list resources/read resources/templates/list)
+
     defp handle_request(conn, opts) do
-      case validate_protocol_version_header(conn, opts) do
-        :ok ->
-          case conn.method do
-            "GET" -> handle_get(conn, opts)
-            "POST" -> handle_post(conn, opts)
-            "DELETE" -> handle_delete(conn, opts)
-            _ -> send_error(conn, 405, "Method not allowed")
-          end
-
-        {:error, version} ->
-          Logging.transport_event("unsupported_protocol_version", %{version: version}, level: :warning)
-
-          send_error(conn, 400, "Unsupported MCP-Protocol-Version: #{version}")
-      end
-    end
-
-    # Per MCP 2025-06-18, clients send the negotiated protocol version on the
-    # MCP-Protocol-Version header of every request after initialize. When the
-    # header is absent the server SHOULD assume 2025-03-26 for backwards
-    # compatibility; when present but unsupported the request is rejected.
-    defp validate_protocol_version_header(conn, opts) do
       case get_req_header(conn, "mcp-protocol-version") do
+        [@modern_version | _] ->
+          handle_modern(conn, opts)
+
         [] ->
-          :ok
+          handle_legacy(conn, opts)
 
         [version | _] ->
           if version in supported_protocol_versions(opts.server) do
-            :ok
+            handle_legacy(conn, opts)
           else
-            {:error, version}
+            Logging.transport_event("unsupported_protocol_version", %{version: version}, level: :warning)
+
+            send_unsupported_version(conn, version, opts, nil)
           end
       end
+    end
+
+    defp handle_legacy(conn, opts) do
+      case conn.method do
+        "GET" -> handle_get(conn, opts)
+        "POST" -> handle_post(conn, opts)
+        "DELETE" -> handle_delete(conn, opts)
+        _ -> send_error(conn, 405, "Method not allowed")
+      end
+    end
+
+    # ---------------------------------------------------------------------------
+    # Modern (2026-07-28) requests
+    # ---------------------------------------------------------------------------
+
+    defp handle_modern(%{method: "POST"} = conn, opts) do
+      with :ok <- validate_accept_header(conn),
+           {:ok, body, conn} <- maybe_read_request_body(conn, opts) do
+        # The modern method set (`server/discover`, `subscriptions/listen`) is
+        # not in the legacy decoder's vocabulary, and the legacy schemas do not
+        # know the modern `_meta` keys, so a modern body is decoded as plain
+        # JSON-RPC here; the session's own handler answers for the method.
+        case parse_modern_message(body) do
+          {:ok, message} ->
+            case validate_modern_headers(conn, message) do
+              :ok -> modern_message(conn, message, opts)
+              {:error, detail} -> send_header_mismatch(conn, detail, extract_request_id(message))
+            end
+
+          {:error, :batch} ->
+            send_jsonrpc_error(
+              conn,
+              Error.protocol(:invalid_request, %{message: "Batched requests are not supported"}),
+              nil
+            )
+
+          {:error, reason} ->
+            send_parse_failure(conn, body, reason)
+        end
+      else
+        {:error, :invalid_accept_header} ->
+          send_error(conn, 406, "Not Acceptable: Client must accept application/json")
+
+        {:error, reason} ->
+          Logging.transport_event("request_error", %{reason: reason}, level: :error)
+          send_jsonrpc_error(conn, Error.protocol(:internal_error, %{reason: reason}), nil)
+      end
+    end
+
+    # The modern revision has no GET stream and no DELETE; a modern client that
+    # sends one gets the answer the specification prescribes.
+    defp handle_modern(conn, _opts), do: send_error(conn, 405, "Method not allowed")
+
+    defp parse_modern_message(body) when is_map(body), do: check_modern_message(body)
+
+    defp parse_modern_message(body) when is_binary(body) do
+      case decode_json(body) do
+        {:ok, decoded} -> check_modern_message(decoded)
+        {:error, _reason} -> {:error, :invalid_json}
+      end
+    end
+
+    defp parse_modern_message(_body), do: {:error, :invalid_request}
+
+    defp check_modern_message(list) when is_list(list), do: {:error, :batch}
+
+    defp check_modern_message(%{"jsonrpc" => "2.0", "method" => method} = message) when is_binary(method) do
+      {:ok, message}
+    end
+
+    defp check_modern_message(_message), do: {:error, :invalid_request}
+
+    defp modern_message(conn, message, opts) do
+      cond do
+        Message.is_notification(message) ->
+          Logging.transport_event("parsed_messages", %{method: message["method"], id: nil, session_id: nil})
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(202, "{}")
+
+        Message.is_request(message) ->
+          Logging.transport_event("parsed_messages", %{
+            method: message["method"],
+            id: message["id"],
+            session_id: nil
+          })
+
+          modern_request(conn, message, opts)
+
+        true ->
+          send_jsonrpc_error(
+            conn,
+            Error.protocol(:invalid_request, %{message: "Invalid message type"}),
+            nil
+          )
+      end
+    end
+
+    # `server/discover` is the one modern method answered without touching the
+    # server process: identity, capabilities and the versions this endpoint
+    # speaks (the modern one plus every legacy one the server accepts).
+    defp modern_request(conn, %{"method" => "server/discover"} = message, opts) do
+      server = opts.server
+
+      result =
+        maybe_put_instructions(
+          %{
+            "resultType" => "complete",
+            "supportedVersions" => discoverable_versions(server),
+            "capabilities" => server.server_capabilities(),
+            "_meta" => %{@meta_server_info => server.server_info()},
+            "ttlMs" => @discover_ttl_ms,
+            "cacheScope" => "private"
+          },
+          server
+        )
+
+      send_modern_result(conn, message["id"], result)
+    end
+
+    # Every other modern request is served through the legacy machinery on a
+    # session that lives for exactly this request: a synthetic `initialize`
+    # (client identity and capabilities read from `_meta`), the request itself,
+    # and teardown. Nothing about the session reaches the client: no session
+    # header is minted, so the next request starts clean again. The legacy
+    # handlers, the authorization context and every tool run unchanged.
+    defp modern_request(conn, message, opts) do
+      session_id = ID.generate_session_id()
+      context = build_request_context(conn, Map.get(opts, :auth_claims))
+
+      case start_new_session(opts, session_id) do
+        {:ok, session_pid} ->
+          try do
+            case Session.dispatch_request(session_pid, synthetic_initialize(message, opts), context,
+                   timeout: opts.timeout
+                 ) do
+              {:ok, _initialized} ->
+                Session.dispatch_notification(session_pid, initialized_notification(), context)
+
+                case Session.dispatch_request(session_pid, strip_modern_meta(message), context, timeout: opts.timeout) do
+                  {:ok, response} when is_binary(response) ->
+                    send_modern_response(conn, message, response, opts.server)
+
+                  {:ok, nil} ->
+                    send_modern_result(conn, message["id"], %{"resultType" => "complete"})
+
+                  {:error, error} ->
+                    handle_request_error(conn, error, message)
+                end
+
+              {:error, error} ->
+                handle_request_error(conn, error, message)
+            end
+          catch
+            :exit, reason ->
+              Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
+
+              send_jsonrpc_error(
+                conn,
+                Error.protocol(:internal_error, %{message: "Server unavailable"}),
+                extract_request_id(message)
+              )
+          after
+            stop_session_process(opts, session_id)
+          end
+
+        {:error, reason} ->
+          send_jsonrpc_error(conn, Error.wrap_reason(reason), extract_request_id(message))
+      end
+    end
+
+    defp synthetic_initialize(message, opts) do
+      meta = modern_meta(message)
+
+      %{
+        "jsonrpc" => "2.0",
+        "id" => "modern-initialize",
+        "method" => "initialize",
+        "params" => %{
+          "protocolVersion" => legacy_version_for(opts.server),
+          "clientInfo" => Map.get(meta, @meta_client_info) || %{"name" => "modern-client", "version" => @modern_version},
+          "capabilities" => Map.get(meta, @meta_client_capabilities) || %{}
+        }
+      }
+    end
+
+    defp initialized_notification, do: %{"jsonrpc" => "2.0", "method" => "notifications/initialized"}
+
+    defp modern_meta(%{"params" => %{"_meta" => meta}}) when is_map(meta), do: meta
+    defp modern_meta(_message), do: %{}
+
+    # The modern `_meta` keys describe the request's era and its sender; the
+    # legacy handlers neither expect nor validate them. Everything else in
+    # `_meta` (a progress token, trace context) is passed through.
+    defp strip_modern_meta(%{"params" => %{"_meta" => meta} = params} = message) when is_map(meta) do
+      case Map.drop(meta, @modern_meta_keys) do
+        empty when map_size(empty) == 0 -> %{message | "params" => Map.delete(params, "_meta")}
+        rest -> %{message | "params" => Map.put(params, "_meta", rest)}
+      end
+    end
+
+    defp strip_modern_meta(message), do: message
+
+    # The newest legacy revision this server accepts; the synthetic initialize
+    # negotiates it so the session behaves exactly as a current legacy client's.
+    defp legacy_version_for(server) do
+      server
+      |> supported_protocol_versions()
+      |> Enum.find(Anubis.Protocol.Registry.latest_version(), fn version ->
+        Anubis.Protocol.Registry.get(version) != :error
+      end)
+    end
+
+    defp discoverable_versions(server) do
+      Enum.uniq([@modern_version | supported_protocol_versions(server)])
+    end
+
+    defp maybe_put_instructions(result, server) do
+      if Anubis.exported?(server, :server_instructions, 0) do
+        case server.server_instructions() do
+          instructions when is_binary(instructions) and instructions != "" ->
+            Map.put(result, "instructions", instructions)
+
+          _ ->
+            result
+        end
+      else
+        result
+      end
+    end
+
+    # A legacy response, re-shaped as a modern result: `resultType` (every
+    # modern result carries one), the server's identity in `_meta`, and cache
+    # hints on the list and read methods that require them. A legacy error
+    # passes through unchanged, except that an unknown method is 404 as the
+    # modern transport prescribes.
+    defp send_modern_response(conn, message, response, server) do
+      case decode_json(response) do
+        {:ok, %{"result" => result} = envelope} when is_map(result) ->
+          shaped = modernize_result(result, message["method"], server)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, encode_json!(Map.put(envelope, "result", shaped)))
+
+        {:ok, %{"error" => %{"code" => -32_601}}} ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(404, response)
+
+        _ ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, response)
+      end
+    end
+
+    defp modernize_result(result, method, server) do
+      result
+      |> Map.put_new("resultType", "complete")
+      |> Map.update("_meta", %{@meta_server_info => server.server_info()}, fn meta ->
+        Map.put_new(meta, @meta_server_info, server.server_info())
+      end)
+      |> maybe_put_cache_hints(method)
+    end
+
+    defp maybe_put_cache_hints(result, method) when method in @cacheable_methods do
+      result
+      |> Map.put_new("ttlMs", @list_ttl_ms)
+      |> Map.put_new("cacheScope", "private")
+    end
+
+    defp maybe_put_cache_hints(result, _method), do: result
+
+    defp send_modern_result(conn, id, result) do
+      body = %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, encode_json!(body))
+    end
+
+    # The mirrored request headers must agree with the body when they are
+    # present; a header the client did not send is not held against it, so
+    # clients from the revision's early days keep working.
+    defp validate_modern_headers(conn, message) do
+      with :ok <- check_header(conn, "mcp-method", message["method"], "Mcp-Method"),
+           :ok <- check_header(conn, "mcp-name", modern_name(message), "Mcp-Name") do
+        check_meta_version(message)
+      end
+    end
+
+    defp check_header(conn, header, body_value, label) do
+      case get_req_header(conn, header) do
+        [] ->
+          :ok
+
+        [value | _] ->
+          if decode_header_value(value) == body_value do
+            :ok
+          else
+            {:error, "#{label} header value #{inspect(value)} does not match body value #{inspect(body_value)}"}
+          end
+      end
+    end
+
+    defp check_meta_version(message) do
+      case Map.get(modern_meta(message), @meta_version) do
+        nil -> :ok
+        @modern_version -> :ok
+        other -> {:error, "MCP-Protocol-Version header #{@modern_version} does not match body value #{inspect(other)}"}
+      end
+    end
+
+    defp modern_name(%{"params" => %{"name" => name}}) when is_binary(name), do: name
+    defp modern_name(%{"params" => %{"uri" => uri}}) when is_binary(uri), do: uri
+    defp modern_name(_message), do: nil
+
+    defp decode_header_value("=?base64?" <> rest) do
+      with true <- String.ends_with?(rest, "?="),
+           {:ok, decoded} <- rest |> String.trim_trailing("?=") |> Base.decode64() do
+        decoded
+      else
+        _ -> "=?base64?" <> rest
+      end
+    end
+
+    defp decode_header_value(value), do: value
+
+    defp send_header_mismatch(conn, detail, id) do
+      send_modern_error(conn, 400, id, @header_mismatch_code, "Header mismatch: #{detail}", nil)
+    end
+
+    defp send_unsupported_version(conn, requested, opts, id) do
+      send_modern_error(conn, 400, id, @unsupported_version_code, "Unsupported protocol version", %{
+        "supported" => discoverable_versions(opts.server),
+        "requested" => requested
+      })
+    end
+
+    defp send_modern_error(conn, status, id, code, message, data) do
+      error = %{"code" => code, "message" => message}
+      error = if data, do: Map.put(error, "data", data), else: error
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(status, encode_json!(%{"jsonrpc" => "2.0", "id" => id, "error" => error}))
     end
 
     defp supported_protocol_versions(server) do
@@ -655,6 +1012,15 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp maybe_read_request_body(%{body_params: body} = conn, _), do: {:ok, body, conn}
+
+    defp encode_json!(data), do: JSON.encode!(data)
+
+    defp decode_json(binary) when is_binary(binary) do
+      case JSON.decode(binary) do
+        {:ok, decoded} -> {:ok, decoded}
+        {:error, reason} -> {:error, reason}
+      end
+    end
 
     defp send_error(conn, status, message) do
       data = %{data: %{message: message, http_status: status}}

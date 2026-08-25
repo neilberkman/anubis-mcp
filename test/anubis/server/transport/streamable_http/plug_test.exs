@@ -501,6 +501,177 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
     end
   end
 
+  describe "modern protocol (2026-07-28)" do
+    setup do
+      task_sup = Registry.task_supervisor_name(StubServer)
+      start_supervised!({Task.Supervisor, name: task_sup})
+      transport_name = Registry.transport_name(StubServer, StubTransport)
+      start_supervised!({StubTransport, name: transport_name})
+      registry_name = Registry.registry_name(StubServer)
+      start_supervised!({Registry.Local, name: registry_name})
+      naming_registry = Registry.naming_registry_name(registry_name)
+      start_supervised!({Elixir.Registry, keys: :unique, name: naming_registry})
+      setup_session_config(registry_mod: Registry.Local)
+      on_exit(&cleanup_session_config/0)
+      session_sup_name = Registry.session_supervisor_name(StubServer)
+      start_supervised!({DynamicSupervisor, name: session_sup_name, strategy: :one_for_one})
+      name = Registry.transport_name(StubServer, :streamable_http)
+      {:ok, _transport} = start_supervised({StreamableHTTP, server: StubServer, name: name, task_supervisor: task_sup})
+      %{opts: StreamableHTTPPlug.init(server: StubServer), session_sup: session_sup_name}
+    end
+
+    defp modern_post(opts, message, headers \\ []) do
+      conn =
+        :post
+        |> conn("/", JSON.encode!(message))
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json, text/event-stream")
+        |> put_req_header("mcp-protocol-version", "2026-07-28")
+
+      headers
+      |> Enum.reduce(conn, fn {k, v}, c -> put_req_header(c, k, v) end)
+      |> StreamableHTTPPlug.call(opts)
+    end
+
+    defp modern_meta do
+      %{
+        "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+        "io.modelcontextprotocol/clientInfo" => %{"name" => "Claude", "version" => "1"},
+        "io.modelcontextprotocol/clientCapabilities" => %{}
+      }
+    end
+
+    defp modern_body(conn), do: JSON.decode!(response_body(conn))
+
+    test "server/discover is answered with no session and the versions this endpoint speaks", %{opts: opts} do
+      conn =
+        modern_post(
+          opts,
+          %{"jsonrpc" => "2.0", "id" => "d1", "method" => "server/discover", "params" => %{"_meta" => modern_meta()}},
+          [{"mcp-method", "server/discover"}]
+        )
+
+      assert {200, _} = {conn.status, response_body(conn)}
+      assert get_resp_header(conn, "mcp-session-id") == []
+
+      %{"id" => "d1", "result" => result} = modern_body(conn)
+      assert result["resultType"] == "complete"
+      assert "2026-07-28" in result["supportedVersions"]
+      assert "2025-11-25" in result["supportedVersions"]
+      assert Map.has_key?(result["capabilities"], "tools")
+      assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "Test Server"
+      assert is_integer(result["ttlMs"])
+      assert result["cacheScope"] == "private"
+    end
+
+    test "tools/list is served on a throwaway session, reshaped as a modern result", %{opts: opts, session_sup: sup} do
+      conn =
+        modern_post(
+          opts,
+          %{"jsonrpc" => "2.0", "id" => 7, "method" => "tools/list", "params" => %{"_meta" => modern_meta()}},
+          [{"mcp-method", "tools/list"}]
+        )
+
+      assert {200, _} = {conn.status, response_body(conn)}
+      assert get_resp_header(conn, "mcp-session-id") == []
+
+      %{"id" => 7, "result" => result} = modern_body(conn)
+      assert [%{"name" => "greet"}] = result["tools"]
+      assert result["resultType"] == "complete"
+      assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "Test Server"
+      assert is_integer(result["ttlMs"])
+      assert result["cacheScope"] == "private"
+
+      # The session that served it is gone.
+      Process.sleep(20)
+      assert DynamicSupervisor.count_children(sup).active == 0
+    end
+
+    test "tools/call runs the tool, with Mcp-Name checked against the body", %{opts: opts} do
+      conn =
+        modern_post(
+          opts,
+          %{
+            "jsonrpc" => "2.0",
+            "id" => 8,
+            "method" => "tools/call",
+            "params" => %{"name" => "greet", "arguments" => %{"name" => "Dan"}, "_meta" => modern_meta()}
+          },
+          [{"mcp-method", "tools/call"}, {"mcp-name", "greet"}]
+        )
+
+      assert conn.status == 200
+      %{"id" => 8, "result" => result} = modern_body(conn)
+      assert is_list(result["content"])
+      assert result["resultType"] == "complete"
+    end
+
+    test "a method the server does not implement is 404 with -32601", %{opts: opts} do
+      conn =
+        modern_post(
+          opts,
+          %{"jsonrpc" => "2.0", "id" => 9, "method" => "subscriptions/listen", "params" => %{"_meta" => modern_meta()}},
+          [{"mcp-method", "subscriptions/listen"}]
+        )
+
+      assert conn.status == 404
+      assert %{"id" => 9, "error" => %{"code" => -32_601}} = modern_body(conn)
+    end
+
+    test "a mirrored header that disagrees with the body is -32020", %{opts: opts} do
+      conn =
+        modern_post(
+          opts,
+          %{"jsonrpc" => "2.0", "id" => 10, "method" => "tools/list", "params" => %{"_meta" => modern_meta()}},
+          [{"mcp-method", "tools/call"}]
+        )
+
+      assert conn.status == 400
+      assert %{"id" => 10, "error" => %{"code" => -32_020}} = modern_body(conn)
+    end
+
+    test "a version this endpoint does not speak is -32022 with the supported list", %{opts: opts} do
+      conn =
+        :post
+        |> conn("/", JSON.encode!(%{"jsonrpc" => "2.0", "id" => 11, "method" => "tools/list", "params" => %{}}))
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json, text/event-stream")
+        |> put_req_header("mcp-protocol-version", "2027-01-01")
+        |> StreamableHTTPPlug.call(opts)
+
+      assert conn.status == 400
+      %{"error" => %{"code" => -32_022, "data" => data}} = modern_body(conn)
+      assert data["requested"] == "2027-01-01"
+      assert "2026-07-28" in data["supported"]
+      assert "2025-11-25" in data["supported"]
+    end
+
+    test "a legacy initialize on the same endpoint still opens a session", %{opts: opts} do
+      conn =
+        :post
+        |> conn(
+          "/",
+          JSON.encode!(%{
+            "jsonrpc" => "2.0",
+            "id" => "init",
+            "method" => "initialize",
+            "params" => %{
+              "protocolVersion" => "2025-11-25",
+              "clientInfo" => %{"name" => "Legacy", "version" => "1"},
+              "capabilities" => %{}
+            }
+          })
+        )
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json, text/event-stream")
+        |> StreamableHTTPPlug.call(opts)
+
+      assert {200, _} = {conn.status, response_body(conn)}
+      assert [session_id] = get_resp_header(conn, "mcp-session-id")
+      assert session_id != ""
+    end
+  end
+
   describe "DELETE endpoint" do
     setup do
       setup_session_config()
